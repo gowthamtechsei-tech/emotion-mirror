@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emotion Mirror Controller</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --text:#e8eaed; --muted:#8a9099; --accent:#22c3ff;
+          --ok:#3ddc84; --warn:#ffb020; --bad:#ff5a5a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 system-ui, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  button { flex:1 1 140px; padding:12px; border:0; border-radius:10px; background:var(--accent);
+           color:#00202c; font-weight:600; font-size:15px; cursor:pointer; }
+  button.secondary { background:#2a2f3a; color:var(--text); }
+  button:disabled { opacity:.4; cursor:default; }
+  .status { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  .chip { padding:6px 10px; border-radius:999px; background:var(--card); font-size:13px; }
+  .chip b { font-weight:600; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--muted); }
+  .card { background:var(--card); border-radius:14px; padding:12px; margin-bottom:12px; }
+  .stage { position:relative; width:100%; aspect-ratio:4/3; background:#000; border-radius:10px; overflow:hidden; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .mirror { transform: scaleX(-1); }
+  #label { font-size:34px; font-weight:700; text-align:center; margin:4px 0 8px; text-transform:capitalize; }
+  .bar { display:grid; grid-template-columns: 80px 1fr 44px; align-items:center; gap:8px; margin:5px 0; font-size:14px; }
+  .track { height:10px; background:#2a2f3a; border-radius:6px; overflow:hidden; }
+  .fill { height:100%; width:0; background:var(--accent); transition: width .15s; }
+  .note { color:var(--muted); font-size:13px; }
+  label.opt { display:flex; align-items:center; gap:8px; font-size:14px; margin-top:6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Emotion Mirror Controller</h1>
+
+  <div class="status">
+    <span class="chip"><span class="dot" id="dModel"></span>AI: <b id="sModel">loading…</b></span>
+    <span class="chip"><span class="dot" id="dCam"></span>Camera: <b id="sCam">off</b></span>
+    <span class="chip"><span class="dot" id="dBle"></span>Robot: <b id="sBle">not connected</b></span>
+    <span class="chip"><span class="dot" id="dFace"></span>Face: <b id="sFace">–</b></span>
+    <span class="chip">Speed: <b id="sFps">–</b></span>
+    <span class="chip">Sent: <b id="sSent">0</b> <span id="sLast" class="note"></span></span>
+  </div>
+
+  <div class="row">
+    <button id="btnCam" disabled>Start camera</button>
+    <button id="btnFlip" class="secondary" disabled>Switch camera</button>
+    <button id="btnBle">Connect robot</button>
+    <button id="btnCal" class="secondary">Recalibrate (look neutral)</button>
+  </div>
+
+  <div class="card">
+    <div class="stage">
+      <video id="video" class="mirror" playsinline muted></video>
+      <canvas id="overlay" class="mirror"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="label">–</div>
+    <div id="bars"></div>
+    <label class="opt"><input type="checkbox" id="optSend" checked> Send to robot</label>
+    <p class="note">Face measurements vs your neutral: <span id="sGeo">–</span></p>
+  </div>
+
+  <p class="note">
+    Works in Chrome or Edge on Android, Windows, Mac and Linux. iPhone Safari has no Bluetooth support for web pages;
+    use the "Bluefy" browser app on iPhone instead. The page must be opened over <b>https://</b> or <b>http://localhost</b>.
+  </p>
+</main>
+
+<script src="human.js"></script>
+<script>
+// ---------------- settings ----------------
+const SERVICE_UUID = '7e5e0001-7c3a-4d5b-9f1e-2a8b6c4d0e01';
+const CHAR_UUID    = '7e5e0002-7c3a-4d5b-9f1e-2a8b6c4d0e01';
+const DEVICE_NAME  = 'EmotionBot';
+const EMA_ALPHA    = 0.5;   // smoothing (higher = faster, jumpier)
+const MIN_SCORE    = { happy:0.45, sad:0.50, angry:0.50, surprise:0.45 }; // below -> neutral
+const CALIB_FRAMES = 15;    // frames of YOUR neutral face used as the baseline
+// How much each expression relies on face-shape measurement vs the emotion AI model.
+// Geometry (smile width, mouth opening, brows) measured against your own neutral face is far more
+// reliable than the emotion model, which e.g. scored an obvious smile as 64% neutral in testing.
+const MODEL_WEIGHT = { happy:0.30, sad:0.25, angry:0.15, surprise:0.15 };
+const HOLD_FRAMES  = 3;     // a new expression must win this many frames in a row
+const SEND_MS      = 120;   // max ~8 messages/second to the robot
+const CLASSES = ['neutral','happy','sad','angry','surprise'];
+
+// ---------------- state ----------------
+const $ = id => document.getElementById(id);
+const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
+let stream = null, facing = 'user', running = false;
+let ema = null, shown = 'neutral', cand = 'neutral', candN = 0;
+let calib = [], base = null, noFaceSince = 0;
+let bleChar = null, bleDevice = null, lastSend = 0, sending = false;
+let frames = 0, fpsT0 = performance.now();
+
+function setStatus(dotId, textId, text, color) { $(textId).textContent = text; $(dotId).style.background = color; }
+
+// bars
+$('bars').innerHTML = CLASSES.map(c =>
+  `<div class="bar"><span>${c}</span><div class="track"><div class="fill" id="f_${c}"></div></div><span id="v_${c}">0%</span></div>`).join('');
+
+// ---------------- AI models ----------------
+// Human library: BlazeFace detector (Google MediaPipe, robust to lighting and all skin tones)
+// + face mesh + emotion classifier. Everything runs locally in the browser.
+const human = new Human.Human({
+  backend: 'humangl', modelBasePath: 'models/', debug: false,
+  filter: { enabled: true, equalization: true },          // auto brightness/contrast (helps backlight)
+  face: {
+    enabled: true,
+    detector: { rotation: false, maxDetected: 1, minConfidence: 0.2, skipFrames: 10, skipTime: 500 },
+    mesh: { enabled: true }, iris: { enabled: false },
+    emotion: { enabled: true, minConfidence: 0.01, skipFrames: 0, skipTime: 0 },   // re-check expression EVERY frame
+    description: { enabled: false }, antispoof: { enabled: false }, liveness: { enabled: false }, attention: { enabled: false },
+  },
+  body: { enabled: false }, hand: { enabled: false }, object: { enabled: false },
+  gesture: { enabled: false }, segmentation: { enabled: false },
+});
+(async () => {
+  try {
+    await human.load();
+    await human.warmup();
+    setStatus('dModel', 'sModel', 'ready (' + human.tf.getBackend() + ')', 'var(--ok)');
+    $('btnCam').disabled = false;
+  } catch (e) {
+    try {                                               // no GPU -> CPU fallback
+      human.config.backend = 'cpu'; await human.load();
+      setStatus('dModel', 'sModel', 'ready (cpu, slow)', 'var(--warn)');
+      $('btnCam').disabled = false;
+    } catch (e2) {
+      setStatus('dModel', 'sModel', 'failed – open via https or localhost', 'var(--bad)');
+      console.error(e, e2);
+    }
+  }
+})();
+
+// ---------------- camera ----------------
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+  } catch (e) {
+    setStatus('dCam', 'sCam', 'blocked: ' + e.name, 'var(--bad)'); return;
+  }
+  video.srcObject = stream;
+  await video.play();
+  video.classList.toggle('mirror', facing === 'user');
+  overlay.classList.toggle('mirror', facing === 'user');
+  setStatus('dCam', 'sCam', facing === 'user' ? 'front' : 'back', 'var(--ok)');
+  $('btnCam').textContent = 'Restart camera';
+  $('btnFlip').disabled = false;
+  if (!running) { running = true; loop(); }
+}
+$('btnCam').onclick = startCamera;
+$('btnFlip').onclick = () => { facing = facing === 'user' ? 'environment' : 'user'; startCamera(); };
+
+// ---------------- Bluetooth ----------------
+$('btnBle').onclick = async () => {
+  if (!navigator.bluetooth) { setStatus('dBle', 'sBle', 'Bluetooth not supported in this browser', 'var(--bad)'); return; }
+  try {
+    setStatus('dBle', 'sBle', 'choosing…', 'var(--warn)');
+    bleDevice = await navigator.bluetooth.requestDevice({ filters: [{ name: DEVICE_NAME }], optionalServices: [SERVICE_UUID] });
+    bleDevice.addEventListener('gattserverdisconnected', () => { bleChar = null; setStatus('dBle', 'sBle', 'disconnected', 'var(--bad)'); });
+    const server = await bleDevice.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    bleChar = await service.getCharacteristic(CHAR_UUID);
+    setStatus('dBle', 'sBle', 'connected', 'var(--ok)');
+  } catch (e) {
+    setStatus('dBle', 'sBle', 'not connected', 'var(--bad)'); console.warn(e);
+  }
+};
+
+let sentCount = 0, sendErrors = 0;
+async function sendToRobot(msg) {
+  if (!bleChar || sending || !$('optSend').checked) return;
+  const now = performance.now();
+  if (now - lastSend < SEND_MS) return;
+  lastSend = now; sending = true;
+  const data = new TextEncoder().encode(msg);
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1000));
+  try {
+    const w = bleChar.properties.writeWithoutResponse ? bleChar.writeValueWithoutResponse(data) : bleChar.writeValueWithResponse(data);
+    await Promise.race([w, timeout]);
+    sentCount++;
+    $('sSent').textContent = sentCount;
+    $('sLast').textContent = msg.split(',')[0];
+  } catch (e) {
+    sendErrors++;
+    $('sSent').textContent = sentCount + ' (errors: ' + sendErrors + ')';
+    console.warn('BLE write failed', e);
+  }
+  sending = false;
+}
+
+// ---------------- face geometry (468-point face mesh) ----------------
+function faceFeatures(mesh) {
+  const P = i => mesh[i];
+  const d = (a, b) => Math.hypot(P(a)[0] - P(b)[0], P(a)[1] - P(b)[1]);
+  const D = d(33, 263) || 1;                                     // eye-to-eye distance = scale
+  const ang = Math.atan2(P(263)[1] - P(33)[1], P(263)[0] - P(33)[0]);
+  const ry = i => -P(i)[0] * Math.sin(ang) + P(i)[1] * Math.cos(ang);   // "up/down" along the face
+  return {
+    open:  d(13, 14) / D,                                        // lips apart
+    width: d(61, 291) / D,                                       // mouth corners apart
+    lift:  ((ry(13) + ry(14)) / 2 - (ry(61) + ry(291)) / 2) / D, // corners above lip centre = smile
+    brow:  ((ry(159) - ry(105)) + (ry(386) - ry(334))) / 2 / D,  // eyebrows height above eyes
+    inner: d(107, 336) / D,                                      // inner brows apart (frown -> smaller)
+    eye:   (d(159, 145) + d(386, 374)) / 2 / D,                  // eyes open
+  };
+}
+const clamp01 = v => Math.max(0, Math.min(1, v));
+function geometryScores(f, b) {
+  const dW = f.width - b.width, dL = f.lift - b.lift, dO = f.open - b.open;
+  const dB = f.brow - b.brow, dI = f.inner - b.inner, dE = f.eye - b.eye;
+  const happy = clamp01((dW / 0.10 + dL / 0.04) / 2);
+  const surprise = clamp01(0.7 * clamp01(dO / 0.15) + 0.3 * clamp01(dB / 0.04) + 0.2 * clamp01(dE / 0.03)) * (1 - 0.7 * happy);
+  const angry = clamp01(0.6 * clamp01(-dI / 0.025) + 0.4 * clamp01(-dB / 0.025)) * (1 - happy);
+  const sad = clamp01(0.7 * clamp01(-dL / 0.025) + 0.3 * clamp01(-dW / 0.05)) * (1 - happy);
+  return { happy, surprise, angry, sad, dbg: `smile ${dW.toFixed(2)}/${dL.toFixed(3)} open ${dO.toFixed(2)} brow ${dB.toFixed(3)} frown ${(-dI).toFixed(3)}` };
+}
+function startCalibration() { calib = []; base = null; ema = null; shown = 'neutral'; cand = 'neutral'; candN = 0; }
+$('btnCal').onclick = startCalibration;
+
+// ---------------- main loop ----------------
+async function loop() {
+  if (video.readyState >= 2) {
+    const res = await human.detect(video);
+    const r = res.face && res.face.length ? res.face[0] : null;
+    $('sFace').textContent = r ? (r.score * 100).toFixed(0) + '%' : 'not found';
+    $('dFace').style.background = r ? 'var(--ok)' : 'var(--bad)';
+    overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+    if (r) {
+      noFaceSince = 0;
+      const e = { angry: 0, disgust: 0, fear: 0, happy: 0, sad: 0, surprise: 0, neutral: 0 };
+      (r.emotion || []).forEach(x => { e[x.emotion] = x.score; });
+      const m = { happy: e.happy, sad: e.sad + 0.5 * e.fear, angry: e.angry + e.disgust, surprise: e.surprise + 0.5 * e.fear };
+      const f = faceFeatures(r.mesh);
+
+      // 1) learn this person's neutral face
+      if (!base) {
+        calib.push(f);
+        $('label').textContent = `calibrating… keep a normal face (${calib.length}/${CALIB_FRAMES})`;
+        if (calib.length >= CALIB_FRAMES) {
+          base = {};
+          for (const k of Object.keys(f)) { const v = calib.map(c => c[k]).sort((a, b) => a - b); base[k] = v[v.length >> 1]; }
+        }
+        sendToRobot('neutral,1,0.5,0.5');
+        requestAnimationFrame(loop); return;
+      }
+
+      // 2) combine geometry (vs your neutral) with the emotion model
+      const g = geometryScores(f, base);
+      const p = {};
+      for (const c of ['happy', 'sad', 'angry', 'surprise']) p[c] = (1 - MODEL_WEIGHT[c]) * g[c] + MODEL_WEIGHT[c] * m[c];
+      p.neutral = clamp01(1 - Math.max(p.happy, p.sad, p.angry, p.surprise));
+      $('sGeo').textContent = g.dbg;
+      if (!ema) ema = { ...p }; else CLASSES.forEach(c => ema[c] += EMA_ALPHA * (p[c] - ema[c]));
+
+      // decide
+      let best = 'neutral';
+      for (const c of ['happy', 'sad', 'angry', 'surprise'])
+        if (ema[c] >= MIN_SCORE[c] && (best === 'neutral' || ema[c] > ema[best])) best = c;
+      if (best === cand) candN++; else { cand = best; candN = 1; }
+      if (candN >= HOLD_FRAMES) shown = cand;
+
+      // UI
+      const [bx, by, bw, bh] = r.box;
+      const b = { x: bx, y: by, width: bw, height: bh };
+      ctx.strokeStyle = '#22c3ff'; ctx.lineWidth = 3; ctx.strokeRect(b.x, b.y, b.width, b.height);
+      CLASSES.forEach(c => { $('f_' + c).style.width = (ema[c] * 100).toFixed(0) + '%'; $('v_' + c).textContent = (ema[c] * 100).toFixed(0) + '%'; });
+      $('label').textContent = shown;
+
+      // face centre 0..1 (as the robot sees it: mirrored for the front camera)
+      let fx = (b.x + b.width / 2) / video.videoWidth, fy = (b.y + b.height / 2) / video.videoHeight;
+      if (facing === 'user') fx = 1 - fx;
+      sendToRobot(`${shown},${ema[shown].toFixed(2)},${fx.toFixed(3)},${fy.toFixed(3)}`);
+    } else {
+      ema = null; cand = 'neutral'; candN = 0;
+      if (!noFaceSince) noFaceSince = performance.now();
+      else if (base && performance.now() - noFaceSince > 3000) startCalibration();   // new person -> recalibrate
+      $('label').textContent = 'no face';
+      sendToRobot('none,0,0.5,0.5');
+    }
+
+    frames++;
+    const now = performance.now();
+    if (now - fpsT0 > 1000) { $('sFps').textContent = (frames * 1000 / (now - fpsT0)).toFixed(0) + ' fps'; frames = 0; fpsT0 = now; }
+  }
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
