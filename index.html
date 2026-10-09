@@ -46,7 +46,7 @@
   </div>
 
   <div class="row">
-    <button id="btnCam" disabled>Start camera</button>
+    <button id="btnCam">Start camera</button>
     <button id="btnFlip" class="secondary" disabled>Switch camera</button>
     <button id="btnBle">Connect robot</button>
     <button id="btnCal" class="secondary">Recalibrate (look neutral)</button>
@@ -120,7 +120,7 @@ const HUMAN_CONFIG = ({
   body: { enabled: false }, hand: { enabled: false }, object: { enabled: false },
   gesture: { enabled: false }, segmentation: { enabled: false },
 });
-let human = null;
+let human = null, aiReady = false;
 (async () => {
   // Find the model files: works whether they are in a "models/" folder or next to index.html
   let modelBase = new URL('models/', location.href).href;
@@ -137,23 +137,35 @@ let human = null;
   const pageDir = new URL('./', location.href).href;                // tfjs-backend-wasm*.wasm live next to index.html
   const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
   // humangl = phone/laptop GPU (fastest). wasm = CPU with SIMD, exact maths (works on GPUs that give wrong results). cpu = last resort.
-  for (const backend of (window.FORCE_BACKENDS || ['humangl', 'wasm', 'cpu'])) {
-    try {
-      setStatus('dModel', 'sModel', 'testing ' + backend + '…', 'var(--warn)');
-      if (human) { try { human.tf.engine().reset(); } catch (e) {} }
-      human = new Human.Human({ ...HUMAN_CONFIG, backend, modelBasePath: modelBase, wasmPath: pageDir, warmup: 'face' });
-      await withTimeout(human.load(), 40000);
-      const test = await withTimeout(human.warmup(), 40000);
-      const f0 = test && test.face && test.face[0];
-      const found = !!(f0 && f0.mesh && f0.mesh.length >= 468);   // detector AND face mesh must work
-      console.log('backend', backend, 'self-test faces:', test && test.face ? test.face.length : 'n/a', 'mesh:', test && test.face && test.face[0] && test.face[0].mesh ? test.face[0].mesh.length : 0);
-      if (found) {
-        setStatus('dModel', 'sModel', 'ready (' + human.tf.getBackend() + ', self-test OK)', backend === 'cpu' ? 'var(--warn)' : 'var(--ok)');
-        $('btnCam').disabled = false;
-        return;
-      }
-      lastErr = backend + ': ' + (f0 ? 'face mesh failed' : 'no face') + ' in self-test';
-    } catch (e) { lastErr = backend + ': ' + (e.message || e); console.warn(e); }
+  // One backend per page load (switching inside a page is unreliable on phones).
+  // Phones start with wasm (exact CPU maths, fast with SIMD); laptops start with the GPU.
+  const params = new URLSearchParams(location.search);
+  const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+  const backend = params.get('backend') || (window.FORCE_BACKENDS && window.FORCE_BACKENDS[0]) || (isMobile ? 'wasm' : 'humangl');
+  const NEXT = { humangl: 'wasm', webgl: 'wasm', wasm: 'cpu' };
+  const t0 = performance.now();
+  const tick = setInterval(() => setStatus('dModel', 'sModel', `loading ${backend}… ${((performance.now() - t0) / 1000).toFixed(0)}s`, 'var(--warn)'), 1000);
+  try {
+    human = new Human.Human({ ...HUMAN_CONFIG, backend, modelBasePath: modelBase, wasmPath: pageDir, warmup: 'face' });
+    await withTimeout(human.load(), 60000);
+    const test = await withTimeout(human.warmup(), 60000);
+    const f0 = test && test.face && test.face[0];
+    const found = !!(f0 && f0.mesh && f0.mesh.length >= 468);   // detector AND face mesh must work
+    console.log('backend', backend, 'self-test faces:', test && test.face ? test.face.length : 'n/a', 'mesh:', f0 && f0.mesh ? f0.mesh.length : 0);
+    if (found) {
+      clearInterval(tick);
+      aiReady = true;
+      setStatus('dModel', 'sModel', 'ready (' + human.tf.getBackend() + ', self-test OK)', backend === 'cpu' ? 'var(--warn)' : 'var(--ok)');
+      return;
+    }
+    lastErr = backend + ': ' + (f0 ? 'face mesh failed' : 'no face') + ' in self-test';
+  } catch (e) { lastErr = backend + ': ' + (e.message || e); console.warn(e); }
+  clearInterval(tick);
+  if (NEXT[backend] && !window.FORCE_BACKENDS) {          // reload the page with the next backend
+    setStatus('dModel', 'sModel', lastErr + ' → trying ' + NEXT[backend], 'var(--warn)');
+    params.set('backend', NEXT[backend]);
+    setTimeout(() => location.replace(location.pathname + '?' + params.toString()), 1500);
+    return;
   }
   const why = location.protocol === 'file:' ? 'open via https or localhost' : lastErr + ' (models at ' + modelBase + ')';
   setStatus('dModel', 'sModel', 'failed – ' + why, 'var(--bad)');
@@ -269,6 +281,7 @@ async function loop() {
   requestAnimationFrame(loop);
 }
 async function step() {
+  if (!aiReady) { $('label').textContent = 'camera on – waiting for AI to finish loading…'; return; }
   if (video.readyState >= 2) {
     const res = await human.detect(video);
     if (res.error) throw new Error(res.error);
