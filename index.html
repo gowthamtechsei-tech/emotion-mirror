@@ -131,23 +131,28 @@ let human = null;
     } catch (e) { /* try next */ }
   }
   console.log('model path:', modelBase);
-  human = new Human.Human({ ...HUMAN_CONFIG, modelBasePath: modelBase });
-  try {
-    await human.load();
-    await human.warmup();
-    setStatus('dModel', 'sModel', 'ready (' + human.tf.getBackend() + ')', 'var(--ok)');
-    $('btnCam').disabled = false;
-  } catch (e) {
-    try {                                               // no GPU -> CPU fallback
-      human = new Human.Human({ ...HUMAN_CONFIG, backend: 'cpu', modelBasePath: modelBase }); await human.load();
-      setStatus('dModel', 'sModel', 'ready (cpu, slow)', 'var(--warn)');
-      $('btnCam').disabled = false;
-    } catch (e2) {
-      const why = location.protocol === 'file:' ? 'open via https or localhost' : 'model files not found at ' + modelBase;
-      setStatus('dModel', 'sModel', 'failed – ' + why, 'var(--bad)');
-      console.error(e, e2);
-    }
+  // Try each AI backend and keep the first one that really finds the built-in test face.
+  // (Some phone GPUs load fine but return no faces – this catches that.)
+  let lastErr = '';
+  for (const backend of ['humangl', 'webgl', 'cpu']) {
+    try {
+      setStatus('dModel', 'sModel', 'testing ' + backend + '…', 'var(--warn)');
+      if (human) { try { human.tf.engine().reset(); } catch (e) {} }
+      human = new Human.Human({ ...HUMAN_CONFIG, backend, modelBasePath: modelBase, warmup: 'face' });
+      await human.load();
+      const test = await human.warmup();
+      const found = test && test.face && test.face.length > 0;
+      console.log('backend', backend, 'self-test faces:', test && test.face ? test.face.length : 'n/a');
+      if (found) {
+        setStatus('dModel', 'sModel', 'ready (' + human.tf.getBackend() + ', self-test OK)', backend === 'cpu' ? 'var(--warn)' : 'var(--ok)');
+        $('btnCam').disabled = false;
+        return;
+      }
+      lastErr = backend + ': no face in self-test';
+    } catch (e) { lastErr = backend + ': ' + (e.message || e); console.warn(e); }
   }
+  const why = location.protocol === 'file:' ? 'open via https or localhost' : lastErr + ' (models at ' + modelBase + ')';
+  setStatus('dModel', 'sModel', 'failed – ' + why, 'var(--bad)');
 })();
 
 // ---------------- camera ----------------
@@ -238,9 +243,19 @@ function startCalibration() { calib = []; base = null; ema = null; shown = 'neut
 $('btnCal').onclick = startCalibration;
 
 // ---------------- main loop ----------------
+let loopErrors = 0;
 async function loop() {
+  try { await step(); } catch (e) {
+    loopErrors++;
+    $('label').textContent = 'AI error: ' + (e.message || e);
+    console.error(e);
+  }
+  requestAnimationFrame(loop);
+}
+async function step() {
   if (video.readyState >= 2) {
     const res = await human.detect(video);
+    if (res.error) throw new Error(res.error);
     const r = res.face && res.face.length ? res.face[0] : null;
     $('sFace').textContent = r ? (r.score * 100).toFixed(0) + '%' : 'not found';
     $('dFace').style.background = r ? 'var(--ok)' : 'var(--bad)';
@@ -263,7 +278,7 @@ async function loop() {
           for (const k of Object.keys(f)) { const v = calib.map(c => c[k]).sort((a, b) => a - b); base[k] = v[v.length >> 1]; }
         }
         sendToRobot('neutral,1,0.5,0.5');
-        requestAnimationFrame(loop); return;
+        return;
       }
 
       // 2) combine geometry (vs your neutral) with the emotion model
@@ -304,7 +319,6 @@ async function loop() {
     const now = performance.now();
     if (now - fpsT0 > 1000) { $('sFps').textContent = (frames * 1000 / (now - fpsT0)).toFixed(0) + ' fps'; frames = 0; fpsT0 = now; }
   }
-  requestAnimationFrame(loop);
 }
 </script>
 </body>
