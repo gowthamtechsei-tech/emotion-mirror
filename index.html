@@ -66,6 +66,7 @@
     <p class="note">Face measurements vs your neutral: <span id="sGeo">–</span></p>
   </div>
 
+  <div class="card" id="diagCard" style="display:none"><b>Diagnostics</b> (send a screenshot of this)<pre id="diag" style="white-space:pre-wrap;font-size:12px;margin:6px 0 0"></pre></div>
   <p class="note">
     Works in Chrome or Edge on Android, Windows, Mac and Linux. iPhone Safari has no Bluetooth support for web pages;
     use the "Bluefy" browser app on iPhone instead. The page must be opened over <b>https://</b> or <b>http://localhost</b>.
@@ -74,6 +75,21 @@
 
 <script src="human.js"></script>
 <script>
+// ---------------- diagnostics (visible on the page, for phones without a console) ----------------
+const diagLines = [];
+function diag(msg) { diagLines.push(msg); const el = document.getElementById('diag'); if (el) el.textContent = diagLines.join('\n'); }
+for (const k of ['log', 'warn', 'error']) {
+  const orig = console[k].bind(console);
+  console[k] = (...a) => { const t = a.map(x => (x && x.message) ? x.message : String(x)).join(' ');
+    if (/error|fail|backend|mesh|model/i.test(t)) diag(k + ': ' + t.slice(0, 300)); orig(...a); };
+}
+async function checkModelFiles(base) {
+  for (const f of ['blazeface.json', 'blazeface.bin', 'facemesh.json', 'facemesh.bin', 'emotion.json', 'emotion.bin']) {
+    try { const r = await fetch(base + f, { cache: 'no-store' }); const b = await r.arrayBuffer(); diag(`${f}: HTTP ${r.status}, ${b.byteLength} bytes`); }
+    catch (e) { diag(`${f}: FETCH FAILED ${e.message || e}`); }
+  }
+}
+
 // ---------------- settings ----------------
 const SERVICE_UUID = '7e5e0001-7c3a-4d5b-9f1e-2a8b6c4d0e01';
 const CHAR_UUID    = '7e5e0002-7c3a-4d5b-9f1e-2a8b6c4d0e01';
@@ -167,6 +183,11 @@ let human = null, aiReady = false;
     setTimeout(() => location.replace(location.pathname + '?' + params.toString()), 1500);
     return;
   }
+  diag('UA: ' + navigator.userAgent);
+  diag('backend tried: ' + backend + ' | ' + lastErr);
+  try { diag('loaded models: ' + JSON.stringify(Object.fromEntries(Object.entries(human.models.models || {}).map(([k, v]) => [k, !!v])))); } catch (e) {}
+  $('diagCard').style.display = 'block';
+  await checkModelFiles(modelBase);
   const why = location.protocol === 'file:' ? 'open via https or localhost' : lastErr + ' (models at ' + modelBase + ')';
   setStatus('dModel', 'sModel', 'failed – ' + why, 'var(--bad)');
 })();
