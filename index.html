@@ -134,13 +134,16 @@ let human = null;
   // Try each AI backend and keep the first one that really finds the built-in test face.
   // (Some phone GPUs load fine but return no faces – this catches that.)
   let lastErr = '';
-  for (const backend of ['humangl', 'webgl', 'cpu']) {
+  const pageDir = new URL('./', location.href).href;                // tfjs-backend-wasm*.wasm live next to index.html
+  const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+  // humangl = phone/laptop GPU (fastest). wasm = CPU with SIMD, exact maths (works on GPUs that give wrong results). cpu = last resort.
+  for (const backend of (window.FORCE_BACKENDS || ['humangl', 'wasm', 'cpu'])) {
     try {
       setStatus('dModel', 'sModel', 'testing ' + backend + '…', 'var(--warn)');
       if (human) { try { human.tf.engine().reset(); } catch (e) {} }
-      human = new Human.Human({ ...HUMAN_CONFIG, backend, modelBasePath: modelBase, warmup: 'face' });
-      await human.load();
-      const test = await human.warmup();
+      human = new Human.Human({ ...HUMAN_CONFIG, backend, modelBasePath: modelBase, wasmPath: pageDir, warmup: 'face' });
+      await withTimeout(human.load(), 40000);
+      const test = await withTimeout(human.warmup(), 40000);
       const f0 = test && test.face && test.face[0];
       const found = !!(f0 && f0.mesh && f0.mesh.length >= 468);   // detector AND face mesh must work
       console.log('backend', backend, 'self-test faces:', test && test.face ? test.face.length : 'n/a', 'mesh:', test && test.face && test.face[0] && test.face[0].mesh ? test.face[0].mesh.length : 0);
