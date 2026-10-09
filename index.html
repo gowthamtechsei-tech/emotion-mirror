@@ -94,7 +94,7 @@ const $ = id => document.getElementById(id);
 const video = $('video'), overlay = $('overlay'), ctx = overlay.getContext('2d');
 let stream = null, facing = 'user', running = false;
 let ema = null, shown = 'neutral', cand = 'neutral', candN = 0;
-let calib = [], base = null, noFaceSince = 0;
+let calib = [], base = null, noFaceSince = 0, meshMisses = 0;
 let bleChar = null, bleDevice = null, lastSend = 0, sending = false;
 let frames = 0, fpsT0 = performance.now();
 
@@ -141,14 +141,15 @@ let human = null;
       human = new Human.Human({ ...HUMAN_CONFIG, backend, modelBasePath: modelBase, warmup: 'face' });
       await human.load();
       const test = await human.warmup();
-      const found = test && test.face && test.face.length > 0;
-      console.log('backend', backend, 'self-test faces:', test && test.face ? test.face.length : 'n/a');
+      const f0 = test && test.face && test.face[0];
+      const found = !!(f0 && f0.mesh && f0.mesh.length >= 468);   // detector AND face mesh must work
+      console.log('backend', backend, 'self-test faces:', test && test.face ? test.face.length : 'n/a', 'mesh:', test && test.face && test.face[0] && test.face[0].mesh ? test.face[0].mesh.length : 0);
       if (found) {
         setStatus('dModel', 'sModel', 'ready (' + human.tf.getBackend() + ', self-test OK)', backend === 'cpu' ? 'var(--warn)' : 'var(--ok)');
         $('btnCam').disabled = false;
         return;
       }
-      lastErr = backend + ': no face in self-test';
+      lastErr = backend + ': ' + (f0 ? 'face mesh failed' : 'no face') + ' in self-test';
     } catch (e) { lastErr = backend + ': ' + (e.message || e); console.warn(e); }
   }
   const why = location.protocol === 'file:' ? 'open via https or localhost' : lastErr + ' (models at ' + modelBase + ')';
@@ -239,6 +240,18 @@ function geometryScores(f, b) {
   const sad = clamp01(0.7 * clamp01(-dL / 0.025) + 0.3 * clamp01(-dW / 0.05)) * (1 - happy);
   return { happy, surprise, angry, sad, dbg: `smile ${dW.toFixed(2)}/${dL.toFixed(3)} open ${dO.toFixed(2)} brow ${dB.toFixed(3)} frown ${(-dI).toFixed(3)}` };
 }
+function drawBox(r) {
+  const [bx, by, bw, bh] = r.box;
+  overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  ctx.strokeStyle = '#22c3ff'; ctx.lineWidth = 3; ctx.strokeRect(bx, by, bw, bh);
+}
+function faceCenter(r) {
+  const [bx, by, bw, bh] = r.box;
+  let fx = (bx + bw / 2) / video.videoWidth, fy = (by + bh / 2) / video.videoHeight;
+  if (facing === 'user') fx = 1 - fx;
+  return `${fx.toFixed(3)},${fy.toFixed(3)}`;
+}
 function startCalibration() { calib = []; base = null; ema = null; shown = 'neutral'; cand = 'neutral'; candN = 0; }
 $('btnCal').onclick = startCalibration;
 
@@ -267,6 +280,21 @@ async function step() {
       const e = { angry: 0, disgust: 0, fear: 0, happy: 0, sad: 0, surprise: 0, neutral: 0 };
       (r.emotion || []).forEach(x => { e[x.emotion] = x.score; });
       const m = { happy: e.happy, sad: e.sad + 0.5 * e.fear, angry: e.angry + e.disgust, surprise: e.surprise + 0.5 * e.fear };
+      const hasMesh = !!(r.mesh && r.mesh.length >= 468);
+      if (!hasMesh) {                      // mesh missing this frame: use the emotion model alone
+        meshMisses++;
+        $('sGeo').textContent = 'face mesh unavailable – using AI model only (' + meshMisses + ')';
+        const p = { happy: m.happy, sad: m.sad, angry: m.angry, surprise: m.surprise };
+        p.neutral = clamp01(1 - Math.max(p.happy, p.sad, p.angry, p.surprise));
+        if (!ema) ema = { ...p }; else CLASSES.forEach(c => ema[c] += EMA_ALPHA * (p[c] - ema[c]));
+        let best = 'neutral';
+        for (const c of ['happy', 'sad', 'angry', 'surprise']) if (ema[c] >= 0.5 && (best === 'neutral' || ema[c] > ema[best])) best = c;
+        shown = best; $('label').textContent = shown;
+        CLASSES.forEach(c => { $('f_' + c).style.width = (ema[c] * 100).toFixed(0) + '%'; $('v_' + c).textContent = (ema[c] * 100).toFixed(0) + '%'; });
+        drawBox(r);
+        sendToRobot(`${shown},${ema[shown].toFixed(2)},${faceCenter(r)}`);
+        return;
+      }
       const f = faceFeatures(r.mesh);
 
       // 1) learn this person's neutral face
@@ -277,6 +305,7 @@ async function step() {
           base = {};
           for (const k of Object.keys(f)) { const v = calib.map(c => c[k]).sort((a, b) => a - b); base[k] = v[v.length >> 1]; }
         }
+        drawBox(r);
         sendToRobot('neutral,1,0.5,0.5');
         return;
       }
