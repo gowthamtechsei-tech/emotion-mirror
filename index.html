@@ -107,8 +107,8 @@ $('bars').innerHTML = CLASSES.map(c =>
 // ---------------- AI models ----------------
 // Human library: BlazeFace detector (Google MediaPipe, robust to lighting and all skin tones)
 // + face mesh + emotion classifier. Everything runs locally in the browser.
-const human = new Human.Human({
-  backend: 'humangl', modelBasePath: '/', debug: false,
+const HUMAN_CONFIG = ({
+  backend: 'humangl', modelBasePath: 'models/', debug: false,
   filter: { enabled: true, equalization: true },          // auto brightness/contrast (helps backlight)
   face: {
     enabled: true,
@@ -120,7 +120,18 @@ const human = new Human.Human({
   body: { enabled: false }, hand: { enabled: false }, object: { enabled: false },
   gesture: { enabled: false }, segmentation: { enabled: false },
 });
+let human = null;
 (async () => {
+  // Find the model files: works whether they are in a "models/" folder or next to index.html
+  let modelBase = new URL('models/', location.href).href;
+  for (const base of ['models/', './']) {
+    try {
+      const r = await fetch(base + 'blazeface.json', { method: 'HEAD', cache: 'no-store' });
+      if (r.ok) { modelBase = new URL(base, location.href).href; break; }
+    } catch (e) { /* try next */ }
+  }
+  console.log('model path:', modelBase);
+  human = new Human.Human({ ...HUMAN_CONFIG, modelBasePath: modelBase });
   try {
     await human.load();
     await human.warmup();
@@ -128,11 +139,12 @@ const human = new Human.Human({
     $('btnCam').disabled = false;
   } catch (e) {
     try {                                               // no GPU -> CPU fallback
-      human.config.backend = 'cpu'; await human.load();
+      human = new Human.Human({ ...HUMAN_CONFIG, backend: 'cpu', modelBasePath: modelBase }); await human.load();
       setStatus('dModel', 'sModel', 'ready (cpu, slow)', 'var(--warn)');
       $('btnCam').disabled = false;
     } catch (e2) {
-      setStatus('dModel', 'sModel', 'failed – open via https or localhost', 'var(--bad)');
+      const why = location.protocol === 'file:' ? 'open via https or localhost' : 'model files not found at ' + modelBase;
+      setStatus('dModel', 'sModel', 'failed – ' + why, 'var(--bad)');
       console.error(e, e2);
     }
   }
