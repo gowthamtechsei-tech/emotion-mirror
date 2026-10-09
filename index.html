@@ -108,7 +108,7 @@ $('bars').innerHTML = CLASSES.map(c =>
 // Human library: BlazeFace detector (Google MediaPipe, robust to lighting and all skin tones)
 // + face mesh + emotion classifier. Everything runs locally in the browser.
 const human = new Human.Human({
-  backend: 'humangl', modelBasePath: 'models/', debug: false,
+  backend: 'humangl', modelBasePath: '/', debug: false,
   filter: { enabled: true, equalization: true },          // auto brightness/contrast (helps backlight)
   face: {
     enabled: true,
